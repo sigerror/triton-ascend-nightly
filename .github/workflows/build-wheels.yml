@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   config:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
@@ -75,7 +75,7 @@ jobs:
 
   resolve:
     needs: config
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -268,7 +268,7 @@ jobs:
     - config
     - resolve
     - build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     env:
