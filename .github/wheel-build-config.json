@@ -1,0 +1,19 @@
+{
+  "python": [
+    "cp310",
+    "cp311",
+    "cp312"
+  ],
+  "platforms": [
+    {
+      "arch": "x86_64",
+      "runner": "ubuntu-latest",
+      "llvm": "almalinux-x64"
+    },
+    {
+      "arch": "aarch64",
+      "runner": "ubuntu-latest-arm",
+      "llvm": "almalinux-arm64"
+    }
+  ]
+}
