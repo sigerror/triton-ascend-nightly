@@ -1,0 +1,405 @@
+name: Build Triton-Ascend wheels
+'on':
+  schedule:
+  - cron: 23 2 * * *
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Upstream branch, tag, or commit SHA
+        type: string
+        default: main
+        required: true
+      force:
+        description: Rebuild even if already published (creates a separate release)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: triton-ascend-wheels
+  cancel-in-progress: false
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+        fetch-depth: 1
+    - name: Load wheel build config
+      id: matrix
+      shell: python
+      run: |
+        import json
+        import os
+        from pathlib import Path
+
+        config = json.loads(Path(".github/wheel-build-config.json").read_text())
+        python_tags = config["python"]
+        platforms = config["platforms"]
+
+        if not python_tags:
+            raise RuntimeError("At least one Python tag is required")
+        if not platforms:
+            raise RuntimeError("At least one platform is required")
+        if len(python_tags) != len(set(python_tags)):
+            raise RuntimeError("Duplicate Python tags in wheel build config")
+
+        required_platform_keys = {"arch", "runner", "llvm"}
+        for platform in platforms:
+            missing = required_platform_keys - platform.keys()
+            if missing:
+                raise RuntimeError(
+                    f"Platform entry is missing required keys: {sorted(missing)}"
+                )
+
+        arches = [platform["arch"] for platform in platforms]
+        if len(arches) != len(set(arches)):
+            raise RuntimeError("Duplicate architectures in wheel build config")
+
+        include = [
+            {"python": python_tag, **platform}
+            for python_tag in python_tags
+            for platform in platforms
+        ]
+        matrix = {"include": include}
+
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(
+                "matrix="
+                + json.dumps(matrix, separators=(",", ":"))
+                + "\n"
+            )
+
+  resolve:
+    needs: config
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+    - name: Resolve upstream and check published wheels
+      id: resolve
+      shell: python
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+        FORCE_BUILD: ${{ inputs.force && 'true' || 'false' }}
+        BUILD_MATRIX: ${{ needs.config.outputs.matrix }}
+      run: |
+        import json
+        import os
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from pathlib import Path
+
+        def api(path, method="GET", payload=None, missing_ok=False):
+            request = urllib.request.Request(
+                "https://api.github.com/" + path,
+                data=None if payload is None else json.dumps(payload).encode(),
+                headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                         "Accept": "application/vnd.github+json",
+                         "Content-Type": "application/json"},
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                if missing_ok and error.code == 404:
+                    return None
+                raise
+
+        import re
+        source_ref = os.environ.get("SOURCE_REF") or "main"
+        ref = urllib.parse.quote(source_ref, safe="")
+        sha = api(f"repos/triton-lang/triton-ascend/commits/{ref}")["sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise RuntimeError("Invalid upstream commit SHA")
+        builder = os.environ["GITHUB_SHA"]
+        tag = f"wheels-{sha[:12]}-{builder[:12]}"
+        release = api(f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{tag}", missing_ok=True)
+        names = [a["name"] for a in (release or {}).get("assets", [])]
+        matrix = json.loads(os.environ["BUILD_MATRIX"])["include"]
+        expected = [(item["python"], item["arch"]) for item in matrix]
+        complete = bool(release and not release["draft"] and "SHA256SUMS" in names and
+            all(any(f"-{py}-{py}-" in n and f"manylinux_2_28_{arch}" in n and n.endswith(".whl")
+                    for n in names) for py, arch in expected))
+        force = os.environ.get("FORCE_BUILD", "false").lower() == "true"
+        # Preserve published assets: explicit rebuilds and repairs use a fresh tag.
+        if force or (release and not release["draft"] and not complete):
+            tag += "-run" + os.environ["GITHUB_RUN_ID"]
+        should_build = force or not complete
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"sha={sha}\ntag={tag}\nbuild={str(should_build).lower()}\n")
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+            summary.write(f"Upstream commit: `{sha}`\n\nRelease: `{tag}`\n\n")
+            summary.write(
+                f"Building {len(expected)} wheels.\n"
+                if should_build
+                else "Complete release already exists; skipped.\n"
+            )
+  build:
+    name: Wheel ${{ matrix.python }} / ${{ matrix.arch }}
+    needs:
+    - config
+    - resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.config.outputs.matrix) }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: triton-lang/triton-ascend
+        ref: ${{ needs.resolve.outputs.sha }}
+        fetch-depth: 1
+        submodules: recursive
+        persist-credentials: false
+    - name: Cache manylinux LLVM and compiler objects
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/manylinux-cache
+        key: ml228-${{ matrix.arch }}-${{ matrix.python }}-v1-${{ hashFiles('cmake/llvm-hash.txt', 'third_party/ascend/patch/llvm_patch_*.patch')
+          }}-${{ needs.resolve.outputs.sha }}
+        restore-keys: |
+          ml228-${{ matrix.arch }}-${{ matrix.python }}-v1-${{ hashFiles('cmake/llvm-hash.txt', 'third_party/ascend/patch/llvm_patch_*.patch') }}-
+    - name: Build and repair inside manylinux 2.28
+      shell: bash
+      env:
+        PYTHON_TAG: ${{ matrix.python }}
+        WHEEL_ARCH: ${{ matrix.arch }}
+        TRITON_LLVM_SYSTEM_SUFFIX: ${{ matrix.llvm }}
+        BUILDER_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/manylinux-cache/llvm" "$RUNNER_TEMP/manylinux-cache/ccache"
+
+        docker run --rm -i \
+          --env BUILDER_SHA \
+          --env PYTHON_TAG \
+          --env WHEEL_ARCH \
+          --env TRITON_LLVM_SYSTEM_SUFFIX \
+          --volume "$GITHUB_WORKSPACE:/io" \
+          --volume "$RUNNER_TEMP/manylinux-cache/llvm:/root/.triton/llvm" \
+          --volume "$RUNNER_TEMP/manylinux-cache/ccache:/ccache" \
+          --workdir /io \
+          "quay.io/pypa/manylinux_2_28_${WHEEL_ARCH}:latest" \
+          bash -seuo pipefail <<'BUILD'
+        test "$(uname -m)" = "$WHEEL_ARCH"
+        export PATH="/opt/python/${PYTHON_TAG}-${PYTHON_TAG}/bin:$PATH"
+        export PIP_INDEX_URL="https://pypi.org/simple"
+        unset PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST LLVM_SYSPATH
+        git config --global --add safe.directory /io
+
+        dnf install -y clang lld ccache zlib-devel
+        python -m pip install --upgrade \
+          pip setuptools wheel 'cmake>=3.20,<4' \
+          'ninja>=1.11.1' 'pybind11>=2.13.1' lit auditwheel
+
+        export MAX_JOBS=2
+        export TRITON_PARALLEL_LINK_JOBS=1
+        export TRITON_BUILD_WITH_CCACHE=true
+        export TRITON_BUILD_WITH_CLANG_LLD=true
+        export TRITON_BUILD_PROTON=OFF
+        export TRITON_BUILD_TD=OFF
+        export TRITON_BUILD_NPUIR=OFF
+        export TRITON_WHEEL_NAME=triton-ascend
+        export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
+        export CCACHE_DIR=/ccache
+        export CCACHE_MAXSIZE=2G
+
+        # Disable setup_ascend.py's automatic repair because the explicit
+        # repair below selects and enforces the glibc 2.28 policy.
+        # This also preserves the development build's +git<sha> version.
+        export IS_MANYLINUX=FALSE
+        python setup_ascend.py bdist_wheel --dist-dir /tmp/raw-wheels
+
+        mkdir -p wheelhouse
+        export BUILD_ID="${PYTHON_TAG}-${WHEEL_ARCH}"
+        for wheel in /tmp/raw-wheels/*.whl; do
+          auditwheel repair \
+            --plat "manylinux_2_28_${WHEEL_ARCH}" \
+            --wheel-dir wheelhouse \
+            "$wheel"
+        done
+
+        # Keep the ABI/dependency report alongside the repaired wheel.
+        for wheel in wheelhouse/*.whl; do
+          auditwheel show "$wheel" | tee "${wheel}.auditwheel.txt"
+        done
+        git rev-parse HEAD > "wheelhouse/${BUILD_ID}-source-commit.txt"
+        git submodule status --recursive > "wheelhouse/${BUILD_ID}-submodules.txt"
+        python --version > "wheelhouse/${BUILD_ID}-python-version.txt"
+        python -m pip freeze > "wheelhouse/${BUILD_ID}-build-tools.txt"
+        echo "$BUILDER_SHA" > "wheelhouse/${BUILD_ID}-builder-commit.txt"
+        # Check that pip can install the repaired wheel, without fetching runtime deps.
+        python -m pip install --no-deps --target /tmp/wheel-install wheelhouse/*.whl
+        # NPU execution and CANN/BishengIR integration are not tested on these CPU runners.
+        BUILD
+        sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/wheelhouse"
+        docker image inspect "quay.io/pypa/manylinux_2_28_${WHEEL_ARCH}:latest" \
+          --format '{{json .RepoDigests}}' > "wheelhouse/${PYTHON_TAG}-${WHEEL_ARCH}-container-digest.json"
+    - name: Restore host ownership after container build
+      if: always()
+      shell: bash
+      run: |
+        for path in "$RUNNER_TEMP/manylinux-cache" "$GITHUB_WORKSPACE/wheelhouse"; do
+          if [ -d "$path" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$path"
+          fi
+        done
+    - name: Upload repaired wheel and build metadata
+      uses: actions/upload-artifact@v7
+      with:
+        name: wheel-${{ matrix.python }}-${{ matrix.arch }}
+        path: wheelhouse/
+        if-no-files-found: error
+        retention-days: 14
+        compression-level: 0
+    if: needs.resolve.outputs.build == 'true'
+  publish:
+    needs:
+    - config
+    - resolve
+    - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      BUILD_MATRIX: ${{ needs.config.outputs.matrix }}
+    steps:
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: wheel-*
+        path: release-assets
+        merge-multiple: true
+    - name: Verify wheel set and generate checksums
+      shell: python
+      run: |
+        import hashlib
+        import json
+        import os
+        import zipfile
+        from email.parser import Parser
+        from pathlib import Path
+
+        directory = Path("release-assets")
+        wheels = sorted(directory.glob("*.whl"))
+        matrix = json.loads(os.environ["BUILD_MATRIX"])["include"]
+        expected = {(item["python"], item["arch"]) for item in matrix}
+        found = set()
+        versions = set()
+        if len(wheels) != len(expected):
+            raise RuntimeError(
+                f"Expected {len(expected)} wheels, found {len(wheels)}"
+            )
+        for wheel in wheels:
+            with zipfile.ZipFile(wheel) as archive:
+                wheel_info = next(n for n in archive.namelist() if n.endswith(".dist-info/WHEEL"))
+                metadata = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+                tags = Parser().parsestr(archive.read(wheel_info).decode()).get_all("Tag", [])
+                versions.add(Parser().parsestr(archive.read(metadata).decode())["Version"])
+                matches = {(py, arch) for py, arch in expected
+                           if f"{py}-{py}-manylinux_2_28_{arch}" in tags}
+                if len(matches) != 1 or found.intersection(matches):
+                    raise RuntimeError(f"Unexpected or duplicate wheel tags: {wheel.name}")
+                found.update(matches)
+        if found != expected or len(versions) != 1:
+            raise RuntimeError("Wheel matrix or package versions do not match")
+        for py, arch in expected:
+            prefix = directory / f"{py}-{arch}"
+            if Path(str(prefix) + "-source-commit.txt").read_text().strip() != os.environ["SOURCE_SHA"]:
+                raise RuntimeError("Mismatched upstream revision")
+            if Path(str(prefix) + "-builder-commit.txt").read_text().strip() != os.environ["GITHUB_SHA"]:
+                raise RuntimeError("Mismatched build configuration revision")
+        lines = []
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.name != "SHA256SUMS":
+                with path.open("rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                lines.append(f"{digest}  {path.name}\n")
+        (directory / "SHA256SUMS").write_text("".join(lines))
+        print(f"Validated all {len(expected)} wheels and generated SHA256SUMS.")
+    - name: Upload draft assets and publish prerelease
+      shell: python
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        import json
+        import os
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from pathlib import Path
+
+        def api(path, method="GET", payload=None, missing_ok=False):
+            request = urllib.request.Request(
+                "https://api.github.com/" + path,
+                data=None if payload is None else json.dumps(payload).encode(),
+                headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                         "Accept": "application/vnd.github+json",
+                         "Content-Type": "application/json"},
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                if missing_ok and error.code == 404:
+                    return None
+                raise
+
+        import re
+        import subprocess
+
+        matrix = json.loads(os.environ["BUILD_MATRIX"])["include"]
+        python_tags = list(dict.fromkeys(item["python"] for item in matrix))
+        architectures = list(dict.fromkeys(item["arch"] for item in matrix))
+
+        def python_version(tag):
+            match = re.fullmatch(r"cp(\d)(\d+)", tag)
+            if not match:
+                raise RuntimeError(f"Unsupported CPython tag: {tag}")
+            return f"{match.group(1)}.{match.group(2)}"
+
+        python_versions = "/".join(python_version(tag) for tag in python_tags)
+        architecture_list = "/".join(architectures)
+
+        repo = os.environ["GITHUB_REPOSITORY"]
+        sha = os.environ["SOURCE_SHA"]
+        tag = os.environ["RELEASE_TAG"]
+        builder = os.environ["GITHUB_SHA"]
+        notes = (
+            "Unofficial Triton-Ascend wheel builds.\n\n"
+            f"Upstream: https://github.com/triton-lang/triton-ascend/commit/{sha}\n\n"
+            f"Build configuration: https://github.com/{repo}/commit/{builder}\n\n"
+            f"Run: https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}\n\n"
+            f"CPython {python_versions}; {architecture_list}; "
+            "manylinux 2.28 (glibc >= 2.28).\n\n"
+            "ABI repair and installation checked; no NPU execution tests. "
+            "Compatible CANN, driver, and BishengIR runtime are still required.\n"
+        )
+        release = api(f"repos/{repo}/releases/tags/{tag}", missing_ok=True)
+        if release and not release["draft"]:
+            raise RuntimeError("Refusing to overwrite a published release; use Force build.")
+        payload = {"name": f"Triton-Ascend {sha[:12]}", "body": notes, "prerelease": True}
+        if release:
+            release = api(f"repos/{repo}/releases/{release['id']}", method="PATCH", payload=payload)
+        else:
+            release = api(f"repos/{repo}/releases", method="POST", payload={
+                **payload, "tag_name": tag, "target_commitish": builder, "draft": True,
+            })
+        assets = [str(p) for p in sorted(Path("release-assets").iterdir()) if p.is_file()]
+        subprocess.run(["gh", "release", "upload", tag, "--repo", repo, "--clobber", *assets], check=True)
+        release = api(f"repos/{repo}/releases/{release['id']}", method="PATCH",
+                      payload={"draft": False, "prerelease": True, "make_latest": "false"})
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+            summary.write(f"Published [wheel release]({release['html_url']}).\n")
