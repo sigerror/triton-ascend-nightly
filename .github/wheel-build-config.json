@@ -7,12 +7,12 @@
   "platforms": [
     {
       "arch": "x86_64",
-      "runner": "ubuntu-latest",
+      "runner": "ubuntu-26.04",
       "llvm": "almalinux-x64"
     },
     {
       "arch": "aarch64",
-      "runner": "ubuntu-latest-arm",
+      "runner": "ubuntu-26.04-arm",
       "llvm": "almalinux-arm64"
     }
   ]
