@@ -159,7 +159,7 @@ jobs:
         repository: triton-lang/triton-ascend
         ref: ${{ needs.resolve.outputs.sha }}
         fetch-depth: 1
-        submodules: recursive
+        submodules: true
         persist-credentials: false
     - name: Cache manylinux LLVM and compiler objects
       uses: actions/cache@v6
@@ -234,7 +234,7 @@ jobs:
           auditwheel show "$wheel" | tee "${wheel}.auditwheel.txt"
         done
         git rev-parse HEAD > "wheelhouse/${BUILD_ID}-source-commit.txt"
-        git submodule status --recursive > "wheelhouse/${BUILD_ID}-submodules.txt"
+        git submodule status > "wheelhouse/${BUILD_ID}-submodules.txt"
         python --version > "wheelhouse/${BUILD_ID}-python-version.txt"
         python -m pip freeze > "wheelhouse/${BUILD_ID}-build-tools.txt"
         echo "$BUILDER_SHA" > "wheelhouse/${BUILD_ID}-builder-commit.txt"
