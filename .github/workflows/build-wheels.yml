@@ -1,4 +1,4 @@
-name: Build Triton-Ascend wheels
+name: Build triton-ascend wheels
 'on':
   schedule:
   - cron: 23 2 * * *
@@ -126,7 +126,7 @@ jobs:
         names = [a["name"] for a in (release or {}).get("assets", [])]
         matrix = json.loads(os.environ["BUILD_MATRIX"])["include"]
         expected = [(item["python"], item["arch"]) for item in matrix]
-        complete = bool(release and not release["draft"] and "SHA256SUMS" in names and
+        complete = bool(release and not release["draft"] and
             all(any(f"-{py}-{py}-" in n and f"manylinux_2_28_{arch}" in n and n.endswith(".whl")
                     for n in names) for py, arch in expected))
         force = os.environ.get("FORCE_BUILD", "false").lower() == "true"
@@ -229,22 +229,17 @@ jobs:
             "$wheel"
         done
 
-        # Keep the ABI/dependency report alongside the repaired wheel.
+        # Print the ABI/dependency report in the build log.
         for wheel in wheelhouse/*.whl; do
-          auditwheel show "$wheel" | tee "${wheel}.auditwheel.txt"
+          auditwheel show "$wheel"
         done
+        # Internal CI inputs for revision validation; never uploaded to releases.
         git rev-parse HEAD > "wheelhouse/${BUILD_ID}-source-commit.txt"
-        git submodule status > "wheelhouse/${BUILD_ID}-submodules.txt"
-        python --version > "wheelhouse/${BUILD_ID}-python-version.txt"
-        python -m pip freeze > "wheelhouse/${BUILD_ID}-build-tools.txt"
         echo "$BUILDER_SHA" > "wheelhouse/${BUILD_ID}-builder-commit.txt"
         # Check that pip can install the repaired wheel, without fetching runtime deps.
         python -m pip install --no-deps --target /tmp/wheel-install wheelhouse/*.whl
         # NPU execution and CANN/BishengIR integration are not tested on these CPU runners.
         BUILD
-        sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/wheelhouse"
-        docker image inspect "quay.io/pypa/manylinux_2_28_${WHEEL_ARCH}:latest" \
-          --format '{{json .RepoDigests}}' > "wheelhouse/${PYTHON_TAG}-${WHEEL_ARCH}-container-digest.json"
     - name: Restore host ownership after container build
       if: always()
       shell: bash
@@ -254,7 +249,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "$path"
           fi
         done
-    - name: Upload repaired wheel and build metadata
+    - name: Upload wheels and internal revision checks
       uses: actions/upload-artifact@v7
       with:
         name: wheel-${{ matrix.python }}-${{ matrix.arch }}
@@ -281,10 +276,9 @@ jobs:
         pattern: wheel-*
         path: release-assets
         merge-multiple: true
-    - name: Verify wheel set and generate checksums
+    - name: Verify wheel set
       shell: python
       run: |
-        import hashlib
         import json
         import os
         import zipfile
@@ -320,14 +314,7 @@ jobs:
                 raise RuntimeError("Mismatched upstream revision")
             if Path(str(prefix) + "-builder-commit.txt").read_text().strip() != os.environ["GITHUB_SHA"]:
                 raise RuntimeError("Mismatched build configuration revision")
-        lines = []
-        for path in sorted(directory.iterdir()):
-            if path.is_file() and path.name != "SHA256SUMS":
-                with path.open("rb") as stream:
-                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                lines.append(f"{digest}  {path.name}\n")
-        (directory / "SHA256SUMS").write_text("".join(lines))
-        print(f"Validated all {len(expected)} wheels and generated SHA256SUMS.")
+        print(f"Validated all {len(expected)} wheels.")
     - name: Upload draft assets and publish prerelease
       shell: python
       env:
@@ -357,47 +344,34 @@ jobs:
                     return None
                 raise
 
-        import re
         import subprocess
-
-        matrix = json.loads(os.environ["BUILD_MATRIX"])["include"]
-        python_tags = list(dict.fromkeys(item["python"] for item in matrix))
-        architectures = list(dict.fromkeys(item["arch"] for item in matrix))
-
-        def python_version(tag):
-            match = re.fullmatch(r"cp(\d)(\d+)", tag)
-            if not match:
-                raise RuntimeError(f"Unsupported CPython tag: {tag}")
-            return f"{match.group(1)}.{match.group(2)}"
-
-        python_versions = "/".join(python_version(tag) for tag in python_tags)
-        architecture_list = "/".join(architectures)
 
         repo = os.environ["GITHUB_REPOSITORY"]
         sha = os.environ["SOURCE_SHA"]
         tag = os.environ["RELEASE_TAG"]
         builder = os.environ["GITHUB_SHA"]
-        notes = (
-            "Unofficial Triton-Ascend wheel builds.\n\n"
-            f"Upstream: https://github.com/triton-lang/triton-ascend/commit/{sha}\n\n"
-            f"Build configuration: https://github.com/{repo}/commit/{builder}\n\n"
-            f"Run: https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}\n\n"
-            f"CPython {python_versions}; {architecture_list}; "
-            "manylinux 2.28 (glibc >= 2.28).\n\n"
-            "ABI repair and installation checked; no NPU execution tests. "
-            "Compatible CANN, driver, and BishengIR runtime are still required.\n"
-        )
+        notes = f"upstream: https://github.com/triton-lang/triton-ascend/commit/{sha}"
         release = api(f"repos/{repo}/releases/tags/{tag}", missing_ok=True)
         if release and not release["draft"]:
             raise RuntimeError("Refusing to overwrite a published release; use Force build.")
-        payload = {"name": f"Triton-Ascend {sha[:12]}", "body": notes, "prerelease": True}
+        payload = {"name": f"triton-ascend {sha[:7]}", "body": notes, "prerelease": True}
         if release:
             release = api(f"repos/{repo}/releases/{release['id']}", method="PATCH", payload=payload)
         else:
             release = api(f"repos/{repo}/releases", method="POST", payload={
                 **payload, "tag_name": tag, "target_commitish": builder, "draft": True,
             })
-        assets = [str(p) for p in sorted(Path("release-assets").iterdir()) if p.is_file()]
+        # Remove non-wheel assets if resuming a draft from the previous workflow.
+        for asset in release.get("assets", []):
+            if not asset["name"].endswith(".whl"):
+                subprocess.run(
+                    ["gh", "release", "delete-asset", tag, asset["name"],
+                     "--repo", repo, "--yes"],
+                    check=True,
+                )
+        assets = [str(p) for p in sorted(Path("release-assets").glob("*.whl")) if p.is_file()]
+        if not assets:
+            raise RuntimeError("No wheels to publish")
         subprocess.run(["gh", "release", "upload", tag, "--repo", repo, "--clobber", *assets], check=True)
         release = api(f"repos/{repo}/releases/{release['id']}", method="PATCH",
                       payload={"draft": False, "prerelease": True, "make_latest": "false"})
